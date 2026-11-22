@@ -1,0 +1,7 @@
+# The deploy scripts and the pipeline run on Linux, so they keep Linux line endings
+# even when the repository is edited and committed on Windows.
+*.sh      text eol=lf
+*.service text eol=lf
+*.yml     text eol=lf
+*.py      text eol=lf
+VERSION   text eol=lf

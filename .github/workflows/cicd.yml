@@ -1,0 +1,287 @@
+# Food Cat CI/CD: every push to main travels all the way to the live server on AWS.
+#
+#   Step 4  Unit tests        pytest. One failing test stops everything after it.
+#   Bonus   Security scans    Bandit (SAST), pip-audit (dependencies) and Gitleaks (secrets), side by side with the tests.
+#   Step 5  Build             deploy/build.py packs the app into build-v<VERSION>-<run number>.zip.
+#   Step 6  Store in S3       the zip goes to s3://<bucket>/builds/, then builds/latest.txt points at it.
+#   Step 7  Deploy            AWS Systems Manager tells the EC2 server to pull the latest build from S3 and install it.
+#   Step 8  Verify            the pipeline asks the live site which build it runs. It must be this one.
+#
+# Settings (GitHub: Settings, Secrets and variables, Actions):
+#   secrets:   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   (the github-foodcat IAM user)
+#   variables: AWS_REGION, S3_BUCKET, EC2_INSTANCE_ID     (not secret, and a secret would hide the site address in the logs)
+#
+# Every action is pinned to an exact commit, with its version in the comment. A tag can be moved to
+# different code later, a commit cannot.
+
+name: Food Cat CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # a "Run workflow" button, handy for a rehearsal
+
+permissions:
+  contents: read
+
+# One deploy at a time. A newer push waits for the running one instead of cancelling it halfway.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+
+# Every script stops at the first failing command, also inside a pipe.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: "Step 4: Unit tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install the packages
+        run: pip install -r requirements-dev.txt
+
+      - name: Run the unit tests
+        run: python -m pytest
+
+  security:
+    name: "Bonus: Security scans (DevSecOps)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get the code with its whole history (Gitleaks checks every commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the scanners
+        run: pip install bandit==1.9.4 pip-audit==2.10.1
+
+      - name: "SAST: Bandit looks for risky code"
+        run: bandit -r foodcat deploy run_local.py demo.py -ll
+
+      - name: "SCA: pip-audit looks for packages with known vulnerabilities"
+        run: pip-audit -r requirements.txt
+
+      - name: "Secrets: Gitleaks looks for passwords and keys in every commit"
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --redact --verbose .
+
+  build:
+    name: "Step 5: Build the zip"
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      zip_name: ${{ steps.build.outputs.zip_name }}
+      build_name: ${{ steps.build.outputs.build_name }}
+    steps:
+      - name: Get the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Package the app as build-v<VERSION>-<run number>.zip
+        id: build
+        run: python deploy/build.py --build-number "$GITHUB_RUN_NUMBER" --commit "$GITHUB_SHA" --out dist
+
+      - name: Keep the zip as a GitHub artifact as well
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.build.outputs.build_name }}
+          path: dist/${{ steps.build.outputs.zip_name }}
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true # lets "Re-run jobs" upload the same build again
+
+  upload:
+    name: "Step 6: Store the build in S3"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ZIP_NAME: ${{ needs.build.outputs.zip_name }}
+    steps:
+      - name: Check the settings
+        run: |
+          if ! echo "$S3_BUCKET" | grep -Eq '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'; then
+            echo "::error::Set the repository variable S3_BUCKET to the bucket name (Settings, Secrets and variables, Actions, Variables)."
+            exit 1
+          fi
+          if ! echo "$AWS_REGION" | grep -Eq '^[a-z]{2}(-[a-z]+)+-[0-9]+$'; then
+            echo "::error::Set the repository variable AWS_REGION, for example ap-south-1."
+            exit 1
+          fi
+
+      - name: Fetch the zip from the build job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.build_name }}
+          path: dist
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload the zip to S3, then mark it as the latest build
+        run: |
+          aws s3 cp "dist/$ZIP_NAME" "s3://$S3_BUCKET/builds/$ZIP_NAME" --no-progress
+          echo "builds/$ZIP_NAME" > latest.txt
+          aws s3 cp latest.txt "s3://$S3_BUCKET/builds/latest.txt" --no-progress
+          echo "Builds in s3://$S3_BUCKET/builds/ now:"
+          aws s3 ls "s3://$S3_BUCKET/builds/"
+
+  deploy:
+    name: "Step 7: Deploy the latest build to EC2"
+    needs: upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ steps.server.outputs.url }}
+    outputs:
+      url: ${{ steps.server.outputs.url }}
+    steps:
+      - name: Get the code (for the deploy script)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check that Systems Manager can reach the server
+        id: server
+        run: |
+          if ! echo "$EC2_INSTANCE_ID" | grep -Eq '^i-[0-9a-f]{8,17}$'; then
+            echo "::error::Set the repository variable EC2_INSTANCE_ID to the instance ID, for example i-0123456789abcdef0."
+            exit 1
+          fi
+          ping=$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
+            --query 'InstanceInformationList[0].PingStatus' --output text)
+          if [ "$ping" != "Online" ]; then
+            echo "::error::Systems Manager cannot reach $EC2_INSTANCE_ID (status: $ping). Is it running, in $AWS_REGION, with the FoodCatEC2Role role?"
+            exit 1
+          fi
+          address=$(aws ec2 describe-instances --instance-ids "$EC2_INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicDnsName' --output text)
+          if [ -z "$address" ] || [ "$address" = "None" ]; then
+            address=$(aws ec2 describe-instances --instance-ids "$EC2_INSTANCE_ID" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          fi
+          echo "The server is online. Its public address is $address"
+          echo "url=http://$address" >> "$GITHUB_OUTPUT"
+
+      - name: Ask the server to pull the latest build from S3 and install it
+        run: |
+          sed -e "s|^export AWS_DEFAULT_REGION=''$|export AWS_DEFAULT_REGION='$AWS_REGION'|" \
+              -e "s|^BUCKET=''$|BUCKET='$S3_BUCKET'|" deploy/pull_latest_build.sh > remote.sh
+          grep -q "^BUCKET='$S3_BUCKET'$" remote.sh
+          jq -Rs '{commands: [.]}' remote.sh > ssm-parameters.json
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Food Cat deploy, run $GITHUB_RUN_NUMBER" \
+            --parameters file://ssm-parameters.json \
+            --query Command.CommandId --output text)
+          echo "Sent SSM command $command_id. Waiting for the server to finish..."
+
+          status=Pending
+          for _ in $(seq 1 72); do # at most six minutes
+            sleep 5
+            status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            echo "  status: $status"
+            case "$status" in Success|Failed|Cancelled|TimedOut) break ;; esac
+          done
+
+          echo "----- what the server printed -----"
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID" \
+            --query StandardOutputContent --output text
+          problems=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID" \
+            --query StandardErrorContent --output text)
+          if [ -n "$problems" ]; then
+            echo "----- errors -----"
+            echo "$problems"
+          fi
+          if [ "$status" != "Success" ]; then
+            echo "::error::The deploy on the server did not succeed (status: $status)."
+            exit 1
+          fi
+
+  verify:
+    name: "Step 8: Verify production"
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SITE: ${{ needs.deploy.outputs.url }}
+      EXPECTED: ${{ needs.build.outputs.build_name }}
+    steps:
+      - name: Ask the live site which build it runs
+        run: |
+          for _ in $(seq 1 12); do
+            live=$(curl -fsS --max-time 5 "$SITE/api/version" || true)
+            if echo "$live" | jq -e --arg want "$EXPECTED" '.build_name == $want' > /dev/null 2>&1; then
+              echo "$SITE runs $EXPECTED:"
+              echo "$live" | jq .
+              page=$(curl -fsS --max-time 5 "$SITE/")
+              grep -q "<title>Food Cat</title>" <<< "$page"
+              echo "The home page loads too."
+              {
+                echo "### Production is live: $SITE"
+                echo "$live" | jq -r '"Version \(.version), build \(.build), commit \(.commit)"'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::$SITE does not show $EXPECTED yet. Check that the security group allows HTTP on port 80."
+          exit 1

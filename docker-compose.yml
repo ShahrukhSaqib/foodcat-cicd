@@ -1,0 +1,141 @@
+# Food Cat on Docker Compose.
+#
+#   cp .env.example .env        (then put your own SECRET_KEY in it)
+#   docker compose up --build
+#
+# Every service runs in its own container with its own database volume. Only the gateway is
+# opened to your computer (http://127.0.0.1:8000). The payment service has no open door at all.
+# The 'queues' volume is shared by everybody, because that one file plays the role of SQS.
+
+name: foodcat
+
+x-environment: &common
+  FOODCAT_DATA_DIR: /data
+  FOODCAT_QUEUE_DIR: /queues
+  FOODCAT_VISIBILITY_TIMEOUT: "5"
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-order-build: &order-build
+  context: .
+  args:
+    SERVICE: order_service
+
+services:
+  gateway:
+    <<: *hardening
+    build:
+      context: .
+      args:
+        SERVICE: gateway
+    image: foodcat-gateway
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      <<: *common
+      PORT: "8000"
+      SECRET_KEY: ${SECRET_KEY:?Copy .env.example to .env and set SECRET_KEY}
+      USER_URLS: http://user:5001
+      ORDER_URLS: http://order-1:5002,http://order-2:5002
+      PAYMENT_URLS: http://payment:5003
+      DELIVERY_URLS: http://delivery:5004
+      ALERTS_URLS: http://alerts:5005
+    volumes:
+      - queues:/queues
+    depends_on:
+      user: {condition: service_healthy}
+      order-1: {condition: service_healthy}
+      order-2: {condition: service_healthy}
+      payment: {condition: service_healthy}
+      delivery: {condition: service_healthy}
+      alerts: {condition: service_healthy}
+
+  user:
+    <<: *hardening
+    build:
+      context: .
+      args:
+        SERVICE: user_service
+    image: foodcat-user
+    environment:
+      <<: *common
+      PORT: "5001"
+      SECRET_KEY: ${SECRET_KEY:?Copy .env.example to .env and set SECRET_KEY}
+    volumes:
+      - user-data:/data
+
+  order-1:
+    <<: *hardening
+    build: *order-build
+    image: foodcat-order
+    environment:
+      <<: *common
+      PORT: "5002"
+      INSTANCE_NAME: order-1
+    volumes:
+      - order-data:/data
+      - queues:/queues
+
+  order-2:
+    <<: *hardening
+    build: *order-build
+    image: foodcat-order
+    environment:
+      <<: *common
+      PORT: "5002"
+      INSTANCE_NAME: order-2
+    volumes:
+      - order-data:/data
+      - queues:/queues
+
+  payment:
+    <<: *hardening
+    build:
+      context: .
+      args:
+        SERVICE: payment_service
+    image: foodcat-payment
+    environment:
+      <<: *common
+      PORT: "5003"
+    volumes:
+      - payment-data:/data
+      - queues:/queues
+
+  delivery:
+    <<: *hardening
+    build:
+      context: .
+      args:
+        SERVICE: delivery_service
+    image: foodcat-delivery
+    environment:
+      <<: *common
+      PORT: "5004"
+    volumes:
+      - delivery-data:/data
+      - queues:/queues
+
+  alerts:
+    <<: *hardening
+    build:
+      context: .
+      args:
+        SERVICE: alert_lambda
+    image: foodcat-alerts
+    environment:
+      <<: *common
+      PORT: "5005"
+    volumes:
+      - alerts-data:/data
+      - queues:/queues
+
+volumes:
+  user-data:
+  order-data:
+  payment-data:
+  delivery-data:
+  alerts-data:
+  queues:

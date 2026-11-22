@@ -1,0 +1,16 @@
+# SCA: GitHub opens a pull request when a package, a base image or a pinned action has a newer
+# version, and warns about packages with known vulnerabilities.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
