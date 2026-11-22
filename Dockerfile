@@ -2,7 +2,7 @@
 #   docker build --build-arg SERVICE=order_service -t foodcat-order .
 # SERVICE is the name of a file in the foodcat folder: gateway, user_service, order_service,
 # payment_service, delivery_service or alert_lambda.
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
