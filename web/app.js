@@ -279,7 +279,7 @@ function hero() {
     h("button", { class: "btn", type: "submit" }, "Search"));
   return h("section", { class: "hero", "aria-label": "Welcome" }, h("div", { class: "wrap hero-in" },
     h("div", {},
-      h("h1", {}, "Hungry? Order your food now."),
+      h("h1", {}, "Hungry? Oder your favourite food now."),
       h("p", {}, "Pick a restaurant, fill your cart and watch your order travel from the kitchen to your door."),
       search,
       h("span", { class: "tag" }, "Free delivery on every order")),
